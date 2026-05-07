@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Turing A/B — Adivinador</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Noto+Sans+JP:wght@400;500;600&family=Noto+Serif+JP:wght@400;500&family=Shippori+Mincho:wght@400;500;600&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="/static/theme.css" />
+</head>
+<body class="turing-app turing-play">
+  <header class="site-header">
+    <div class="site-header__inner">
+      <div class="site-header__titles">
+        <h1>Test Turing A/B</h1>
+        <p class="sub">Tienes 2 minutos desde tu primera pregunta. Las respuestas aparecen cuando A y B han contestado cada turno.</p>
+      </div>
+      <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Cambiar tema" title="Tema">
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="3" />
+          <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+        </svg>
+      </button>
+    </div>
+  </header>
+  <div class="site-wrap">
+  <main class="site-main">
+    <p id="err" class="err" hidden></p>
+
+    <section id="viewGate" class="view active">
+      <div class="gate">
+        <p id="gateMsg">Comprobando enlace…</p>
+      </div>
+    </section>
+
+    <section id="viewChat" class="view">
+      <div id="timerBar" class="timer-bar">Sincronizando…</div>
+
+      <div class="chats">
+        <div class="chat">
+          <h2>Conversación A</h2>
+          <div class="msgs" id="msgsA"></div>
+        </div>
+        <div class="chat">
+          <h2>Conversación B</h2>
+          <div class="msgs" id="msgsB"></div>
+        </div>
+      </div>
+
+      <div id="composerRow" class="row">
+        <div class="field" style="flex: 2;">
+          <label for="msg">Tu mensaje (se envía a A y B)</label>
+          <textarea id="msg" placeholder="Escribe tu mensaje…"></textarea>
+        </div>
+        <button type="button" id="btnSend" disabled>Enviar</button>
+      </div>
+
+      <div id="pickPanel" class="pick-panel" hidden aria-live="polite">
+        <h2 class="pick-title">¿En qué conversación crees que está la IA?</h2>
+        <div class="pick-actions">
+          <button type="button" class="secondary" id="pickAIinA">La IA está en A</button>
+          <button type="button" class="secondary" id="pickAIinB">La IA está en B</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="viewResult" class="view-fullscreen" aria-live="polite">
+      <div id="resultBox" class="result-screen">
+        <h2 id="resultTitle"></h2>
+        <p id="resultDetail"></p>
+      </div>
+    </section>
+  </main>
+  </div>
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    const params = new URLSearchParams(window.location.search);
+    const guesserToken = (params.get('t') || params.get('token') || '').trim();
+
+    let sessionId = null;
+    let lastA = 0, lastB = 0;
+    let pollTimer = null;
+    let statusTimer = null;
+    let serverSkewMs = 0;
+    const seenMessageIds = new Set();
+    let pollBusy = false;
+
+    function showView(name) {
+      $('viewGate').classList.toggle('active', name === 'gate');
+      const chatOn = name === 'chat' || name === 'pick';
+      $('viewChat').classList.toggle('active', chatOn);
+      $('viewChat').classList.toggle('pick-open', name === 'pick');
+      $('viewResult').classList.toggle('active', name === 'result');
+      const pickPanel = $('pickPanel');
+      if (pickPanel) {
+        pickPanel.hidden = name !== 'pick';
+      }
+      const composer = $('composerRow');
+      if (composer) {
+        composer.hidden = name === 'pick';
+      }
+    }
+
+    function showErr(msg) {
+      const el = $('err');
+      if (!msg) { el.hidden = true; el.textContent = ''; return; }
+      el.textContent = msg;
+      el.hidden = false;
+    }
+
+    async function api(path, opts = {}) {
+      const r = await fetch(path, {
+        ...opts,
+        headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+      });
+      const text = await r.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch (_) {}
+      if (!r.ok) {
+        const d = (data && data.detail) ? (Array.isArray(data.detail) ? data.detail.map(x => x.msg).join('; ') : data.detail) : text;
+        throw new Error(d || r.statusText);
+      }
+      return data;
+    }
+
+    function esc(s) {
+      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    function appendMessage(container, m) {
+      if (seenMessageIds.has(m.id)) return;
+      seenMessageIds.add(m.id);
+      const role = m.role === 'guesser' ? 'Tú' : 'Respuesta';
+      const cls = m.role === 'guesser' ? 'guesser' : 'responder';
+      const div = document.createElement('div');
+      div.className = 'bubble ' + cls;
+      div.dataset.msgId = String(m.id);
+      div.innerHTML = '<div class="meta">' + role + '</div>' + esc(m.content);
+      container.appendChild(div);
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function applyStatus(st) {
+      serverSkewMs = Date.parse(st.server_now) - Date.now();
+      const bar = $('timerBar');
+      bar.hidden = false;
+      bar.classList.remove('done');
+
+      if (!st.guess_unlock_at) {
+        bar.innerHTML =
+          'El temporizador de <strong>2 minutos</strong> empieza cuando envíes tu <strong>primera pregunta</strong>.';
+        $('btnSend').disabled = false;
+        return;
+      }
+
+      const unlockMs = Date.parse(st.guess_unlock_at);
+      const now = Date.now() + serverSkewMs;
+      const left = Math.max(0, unlockMs - now);
+      if (left > 0) {
+        const sec = Math.ceil(left / 1000);
+        const m = Math.floor(sec / 60);
+        const s = sec % 60;
+        bar.innerHTML =
+          'Tiempo restante: <strong>' + m + ':' + String(s).padStart(2, '0') + '</strong>. ' +
+          'Las respuestas se muestran cuando <strong>ambos</strong> canales han contestado.';
+        $('btnSend').disabled = false;
+      } else {
+        bar.classList.add('done');
+        bar.innerHTML = '<strong>Tiempo agotado.</strong> Elige en qué conversación está la IA.';
+        $('btnSend').disabled = true;
+        stopPoll();
+        showView('pick');
+        const pp = $('pickPanel');
+        if (pp) requestAnimationFrame(() => pp.scrollIntoView({ behavior: 'smooth', block: 'nearest' }));
+      }
+    }
+
+    async function pollStatus() {
+      if (!sessionId) return;
+      try {
+        const st = await api(`/session/status?session_id=${encodeURIComponent(sessionId)}`);
+        if (st.guess_submitted) {
+          stopPoll();
+          return;
+        }
+        applyStatus(st);
+      } catch (e) {
+        showErr(String(e.message || e));
+      }
+    }
+
+    function stopPoll() {
+      if (pollTimer) clearInterval(pollTimer);
+      if (statusTimer) clearInterval(statusTimer);
+      pollTimer = null;
+      statusTimer = null;
+    }
+
+    async function poll() {
+      if (!sessionId || pollBusy) return;
+      pollBusy = true;
+      const base = `/messages?session_id=${encodeURIComponent(sessionId)}&guesser_sync=true`;
+      try {
+        const [aNew, bNew] = await Promise.all([
+          api(`${base}&channel=A&since_id=${lastA}`),
+          api(`${base}&channel=B&since_id=${lastB}`),
+        ]);
+        const boxA = $('msgsA');
+        const boxB = $('msgsB');
+        for (const m of aNew) {
+          appendMessage(boxA, m);
+          lastA = m.id;
+        }
+        for (const m of bNew) {
+          appendMessage(boxB, m);
+          lastB = m.id;
+        }
+      } catch (e) {
+        showErr(String(e.message || e));
+      } finally {
+        pollBusy = false;
+      }
+    }
+
+    function startPoll() {
+      stopPoll();
+      pollTimer = setInterval(poll, 1500);
+      statusTimer = setInterval(pollStatus, 1000);
+      poll();
+      pollStatus();
+    }
+
+    function showResult(res) {
+      const box = $('resultBox');
+      const title = $('resultTitle');
+      const detail = $('resultDetail');
+      box.classList.remove('ok', 'bad', 'neutral');
+      if (res.scored) {
+        if (res.was_correct) {
+          box.classList.add('ok');
+          title.textContent = 'Correcto';
+          detail.textContent = 'Tu elección coincide con la configuración de esta sesión.';
+        } else {
+          box.classList.add('bad');
+          title.textContent = 'Incorrecto';
+          detail.textContent = 'No era la opción correcta para esta ronda.';
+        }
+      } else {
+        box.classList.add('neutral');
+        title.textContent = 'Elección registrada';
+        detail.textContent = 'En esta sesión no hay puntuación de acierto (por ejemplo, dos modelos o dos humanos sin criterio único).';
+      }
+      showView('result');
+    }
+
+    async function sendGuess(thinkAiIn) {
+      if (!sessionId) return;
+      showErr('');
+      try {
+        const res = await api('/guess', {
+          method: 'POST',
+          body: JSON.stringify({ session_id: sessionId, think_ai_in: thinkAiIn }),
+        });
+        stopPoll();
+        $('pickAIinA').disabled = true;
+        $('pickAIinB').disabled = true;
+        showResult(res);
+      } catch (e) {
+        showErr(String(e.message || e));
+        $('pickAIinA').disabled = false;
+        $('pickAIinB').disabled = false;
+      }
+    }
+
+    $('pickAIinA').onclick = () => sendGuess('A');
+    $('pickAIinB').onclick = () => sendGuess('B');
+
+    $('btnSend').onclick = async () => {
+      const text = $('msg').value.trim();
+      if (!sessionId || !text) return;
+      const btn = $('btnSend');
+      if (btn.disabled) return;
+      showErr('');
+      btn.disabled = true;
+      try {
+        await api('/message', {
+          method: 'POST',
+          body: JSON.stringify({ session_id: sessionId, content: text }),
+        });
+        $('msg').value = '';
+        await poll();
+        await pollStatus();
+      } catch (e) {
+        showErr(String(e.message || e));
+      } finally {
+        if (!$('timerBar').classList.contains('done')) btn.disabled = false;
+      }
+    };
+
+    (async function boot() {
+      if (!guesserToken) {
+        $('gateMsg').innerHTML =
+          'Falta el token en la URL. El anfitrión debe enviarte un enlace del tipo ' +
+          '<code>/play?t=…</code>.';
+        showErr('Enlace incompleto.');
+        return;
+      }
+      try {
+        const res = await api(
+          '/session/resolve-guesser?token=' + encodeURIComponent(guesserToken)
+        );
+        sessionId = res.session_id;
+        showErr('');
+        $('gateMsg').textContent = '';
+        showView('chat');
+        $('timerBar').hidden = false;
+        startPoll();
+      } catch (e) {
+        $('gateMsg').textContent = String(e.message || e);
+        showErr(String(e.message || e));
+      }
+    })();
+  </script>
+  <script src="/static/assets/js/theme-switcher.js"></script>
+</body>
+</html>
